@@ -1,29 +1,64 @@
-import os, re, unicodedata, math, time, json, requests
-import pandas as pd, numpy as np, geopandas as gpd
-from datetime import timedelta
+# app.py
+# ------------------------------------------------------------------
+# Streamlit + Folium + Nominatim (POIs dentro del viewbox de la CDMX)
+# - POIs: bancos, cajeros, coworking, museos, hoteles, atracciones
+# - Búsqueda por nombre (Search) sobre todos los POIs agregados
+# - Render robusto (folium_static) + fallback HTML
+# ------------------------------------------------------------------
+import os, re, unicodedata, time, requests, warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
+import streamlit as st
+import streamlit.components.v1 as components
+from streamlit_folium import folium_static
+
 import folium
-from folium import plugins
 from folium.features import GeoJson, GeoJsonTooltip
-from folium.plugins import MeasureControl, Search
+from folium.plugins import (
+    Search,
+    HeatMapWithTime,
+    Fullscreen,
+    MiniMap,
+    MousePosition,
+    MeasureControl,
+)
 from branca.colormap import linear
-from shapely.geometry import shape
 
-"""
-## 3) Configure Paths
+# =============== Config ===============
+st.set_page_config(page_title="Security Challenge — POIs Nominatim", layout="wide")
+BASE_DIR = Path(__file__).parent
 
-Update `BASE_DIR` to where your datasets live in Drive.
-"""
+# =============== Sidebar ===============
+st.sidebar.title("⚙️ Parámetros")
+COLONIAS_PATH = st.sidebar.text_input(
+    "Colonias (SHP/GeoJSON/ZIP)", str(BASE_DIR / "colonias.shp")
+)
+METRO_CSV = st.sidebar.text_input("Metro CSV", str(BASE_DIR / "metro_data.csv"))
+CRIMES_CSV = st.sidebar.text_input(
+    "Crímenes CSV", str(BASE_DIR / "FGJ_CLEAN_Team2.csv")
+)
 
-# === PATHS (absolute, strings) ===
-BASE_DIR     = os.path.dirname(__file__)
-COLONIAS_SHP = os.path.join(BASE_DIR, 'colonias.shp')
-METRO_CSV    = os.path.join(BASE_DIR, 'metro_data.csv')
-CRIMES_OPT   = os.path.join(BASE_DIR, 'FGJ_CLEAN_Team2.csv')
+PLACE = st.sidebar.text_input("Área Nominatim (PLACE)", "Ciudad de México")
+st.sidebar.caption("POIs personalizados (se usan *dentro* del viewbox de Nominatim)")
+CUSTOM_POI_TEXT = st.sidebar.text_input(
+    "POIs personalizados (coma-separados)", "alamedas,bellas artes,zocalo,bancos"
+)
+CUSTOM_POIS = [q.strip() for q in CUSTOM_POI_TEXT.split(",") if q.strip()]
 
-"""
-## 4) Helper Functions
-"""
+st.sidebar.markdown("---")
+st.sidebar.caption("Sube archivos para sobreescribir rutas (opcional)")
+up_colonias = st.sidebar.file_uploader(
+    "Colonias (SHP/GeoJSON/ZIP)", type=["shp", "geojson", "zip"]
+)
+up_metro = st.sidebar.file_uploader("Metro CSV", type=["csv"])
+up_crimes = st.sidebar.file_uploader("Crímenes CSV", type=["csv"])
 
+
+# =============== Helpers ===============
 def pick_col_ci(cols, candidates):
     m = {c.lower(): c for c in cols}
     for k in candidates:
@@ -31,202 +66,41 @@ def pick_col_ci(cols, candidates):
             return m[k.lower()]
     return None
 
+
 def clean_parens(x):
-    import re
     if not isinstance(x, str):
         return x
-    return re.sub(r'\s*\([^)]*\)', '', x).strip()
+    return re.sub(r"\s*\([^)]*\)", "", x).strip()
+
 
 def key_norm_str(x):
     if not isinstance(x, str):
-        return ''
-    s = unicodedata.normalize('NFD', x)
-    s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
-    s = re.sub(r'[^\w\s]', ' ', s)
+        return ""
+    s = unicodedata.normalize("NFD", x)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    s = re.sub(r"[^\w\s]", " ", s)
     s = s.upper().strip()
-    return re.sub(r'\s+', ' ', s)
+    return re.sub(r"\s+", " ", s)
+
 
 def key_norm(sr):
     return sr.astype(str).map(key_norm_str)
 
-"""
-## 5) Load Data (Colonias, Metro, Crimes) & Build Base Layers
-"""
 
-# Colonias
-colonias_raw = gpd.read_file(COLONIAS_SHP).to_crs(4326)
-col_name_src = pick_col_ci(colonias_raw.columns, ['nomut','nomdt','nombre','nom_col','nomgeo','name','colonia'])
-colonias_raw['Colony'] = colonias_raw[col_name_src].map(clean_parens)
-colonias = colonias_raw.dissolve(by='Colony', as_index=False)
-colonias['key_norm'] = key_norm(colonias['Colony'])
+def valid_bounds(b):
+    return (
+        b is not None
+        and len(b) == 4
+        and all(np.isfinite(v) for v in b)
+        and (b[2] > b[0])
+        and (b[3] > b[1])
+    )
 
-col_m = colonias.to_crs(3857)
-colonias['Area_km²'] = (col_m.geometry.area / 1e6).values
 
-# Delegations (optional)
-deleg_col = pick_col_ci(colonias_raw.columns, ['nomdt','alcaldia','delegacion','municipio','mun'])
-deleg = None
-if deleg_col is not None:
-    deleg = (colonias_raw.assign(Deleg=colonias_raw[deleg_col].map(clean_parens))
-             .dissolve(by='Deleg', as_index=False)[['Deleg','geometry']]
-             .to_crs(4326))
-
-# Metro
-mdf = pd.read_csv(METRO_CSV)
-lon_m = pick_col_ci(mdf.columns, ['longitud','lon','longitude','lng','x'])
-lat_m = pick_col_ci(mdf.columns, ['latitud','lat','latitude','y'])
-nam_m = pick_col_ci(mdf.columns, ['nombre','name','station','estacion','estación'])
-xfer_m= pick_col_ci(mdf.columns, ['es_transbordo','transbordo','transfer','is_transfer'])
-
-if nam_m is None: mdf['station_name'] = np.arange(len(mdf)).astype(str)
-else:            mdf = mdf.rename(columns={nam_m:'station_name'})
-if xfer_m is None: mdf['es_transbordo'] = 0
-else:              mdf = mdf.rename(columns={xfer_m:'es_transbordo'})
-
-mdf['station_key'] = key_norm(mdf['station_name'])
-canon = (mdf.groupby('station_key')['station_name']
-           .agg(lambda s: s.mode().iat[0] if not s.mode().empty else s.iloc[0])
-           .rename('station_canon'))
-mdf = mdf.merge(canon, on='station_key', how='left')
-
-metro_all = gpd.GeoDataFrame(
-    mdf[['station_key','station_canon','es_transbordo', lon_m, lat_m]].copy(),
-    geometry=gpd.points_from_xy(mdf[lon_m], mdf[lat_m]), crs='EPSG:4326')
-
-# Crimes
-candidates_date = ['fecha','fecha_hechos','f_hecho','date','datetime','created_at','fechahora','hora_hecho']
-candidates_grp  = ['delito_grupo','crime_group','offense_group','category']
-candidates_lon  = ['longitud','longitude','lon','lng','x']
-candidates_lat  = ['latitud','latitude','lat','y']
-candidates_wthr = ['conditions','weather','clima','condicion','condiciones']
-
-hdr = pd.read_csv(CRIMES_OPT, nrows=0)
-c_grp = pick_col_ci(hdr.columns, candidates_grp)
-c_lon = pick_col_ci(hdr.columns, candidates_lon)
-c_lat = pick_col_ci(hdr.columns, candidates_lat)
-c_dat = pick_col_ci(hdr.columns, candidates_date)
-c_wth = pick_col_ci(hdr.columns, candidates_wthr)
-
-usecols = [c for c in [c_grp,c_lon,c_lat,c_dat,c_wth] if c is not None]
-cr_df = pd.read_csv(CRIMES_OPT, usecols=usecols, low_memory=False)
-
-raw_norm = key_norm(cr_df[c_grp])
-map_dict = {
-    'ROBO TRANSEUNTE': 'ROBBERY_PEDESTRIAN',
-    'ROBO A TRANSEUNTE': 'ROBBERY_PEDESTRIAN',
-    'ROBBERY_PEDESTRIAN': 'ROBBERY_PEDESTRIAN',
-    'ROBO OBJETOS': 'ROBBERY_OBJECT',
-    'ROBO DE OBJETOS': 'ROBBERY_OBJECT',
-    'ROBBERY_OBJECT': 'ROBBERY_OBJECT',
-}
-cr_df['_crime_norm'] = raw_norm.map(map_dict).fillna(raw_norm)
-cr_df = cr_df[cr_df['_crime_norm'].isin({'ROBBERY_PEDESTRIAN','ROBBERY_OBJECT'})].copy()
-
-cr_df['_lon'] = pd.to_numeric(cr_df[c_lon], errors='coerce')
-cr_df['_lat'] = pd.to_numeric(cr_df[c_lat], errors='coerce')
-cr_df = cr_df.dropna(subset=['_lon','_lat'])
-
-if c_dat is not None:
-    cr_df['_ts'] = pd.to_datetime(cr_df[c_dat], errors='coerce', utc=True).dt.tz_convert('America/Mexico_City')
-else:
-    cr_df['_ts'] = pd.NaT
-
-if c_wth is not None:
-    cr_df['_weather'] = cr_df[c_wth].astype(str).str.strip()
-else:
-    cr_df['_weather'] = np.nan
-
-gdf_crimes = gpd.GeoDataFrame(cr_df, geometry=gpd.points_from_xy(cr_df['_lon'], cr_df['_lat']), crs='EPSG:4326')
-
-# Incidents per colony
-joined = gpd.sjoin(gdf_crimes, colonias[['key_norm','geometry']], how='inner', predicate='within')
-counts = joined.groupby('key_norm').size().rename('Incidents').reset_index()
-choropleth = (colonias[['Colony','key_norm','geometry','Area_km²']]
-              .merge(counts, on='key_norm', how='left')
-              .fillna({'Incidents':0}))
-choropleth['Incidents_per_km²'] = (choropleth['Incidents'] / choropleth['Area_km²'].replace({0:np.nan})).fillna(0.0)
-
-# Base map
-bounds = choropleth.total_bounds
-minx, miny, maxx, maxy = bounds
-center_lon, center_lat = (minx+maxx)/2, (miny+maxy)/2
-m = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles='cartodbpositron', control_scale=True)
-m.fit_bounds([[miny,minx],[maxy,maxx]])
-plugins.Fullscreen().add_to(m)
-plugins.MiniMap(toggle_display=True).add_to(m)
-plugins.MeasureControl(primary_length_unit='meters').add_to(m)
-plugins.MousePosition(position='bottomright').add_to(m)
-
-# Heatmap animation (24h window)
-if cr_df['_ts'].notna().any():
-    tmax = pd.to_datetime(cr_df.loc[cr_df['_ts'].notna(), '_ts']).max()
-    tmin = tmax - pd.Timedelta(hours=24)
-    recent = gdf_crimes[(gdf_crimes['_ts']>=tmin) & (gdf_crimes['_ts']<=tmax)].copy()
-    if len(recent):
-        recent['hour'] = recent['_ts'].dt.floor('H')
-        hours = sorted(recent['hour'].unique())
-        heat_seq = [recent[recent['hour']==h][['_lat','_lon']].values.tolist() for h in hours]
-        plugins.HeatMapWithTime(
-            heat_seq, index=[str(h) for h in hours], auto_play=False, max_opacity=0.8, radius=9,
-            name="Heatmap robos"
-        ).add_to(m)
-
-# Colonias (límites)
-colonies_layer = folium.FeatureGroup(name='Colonias (límites)', show=False)
-GeoJson(
-    data=colonias[['Colony','geometry']].to_json(),
-    style_function=lambda f: {"fillOpacity": 0.0, "color": "#7e22ce", "weight": 1.2},
-    tooltip=GeoJsonTooltip(fields=['Colony'], aliases=['Colonia'])
-).add_to(colonies_layer)
-colonies_layer.add_to(m)
-
-# Estaciones de Metro
-metro_layer = folium.FeatureGroup(name='Estaciones de Metro', show=False)
-for _, r in metro_all.iterrows():
-    if r.geometry is None or pd.isna(r.geometry.x) or pd.isna(r.geometry.y):
-        continue
-    folium.CircleMarker(
-        location=[r.geometry.y, r.geometry.x],
-        radius=4, color='#44403c', fill=True, fill_opacity=1.0,
-        tooltip=f"{r.get('station_canon','(station)')} | Transferencia: {int(r.get('es_transbordo',0))}"
-    ).add_to(metro_layer)
-metro_layer.add_to(m)
-
-# Densidad de robos (Incidents/km²)
-vmin = float(choropleth["Incidents_per_km²"].min())
-vmax = float(choropleth["Incidents_per_km²"].max())
-cmap = linear.Purples_09.scale(vmin, vmax)
-cmap.caption = "Incidentes por km² (robos seleccionados)"
-
-_ch = choropleth.copy()
-_ch["val"] = _ch["Incidents_per_km²"].astype(float)
-
-density_layer = folium.FeatureGroup(name="Densidad de robos (Inc./km²)", show=True)
-GeoJson(
-    data=_ch.to_json(),
-    style_function=lambda f: {
-        "fillColor": cmap(f["properties"]["val"]) if f["properties"]["val"] is not None else "#f3f0ff",
-        "color": "#4b5563",
-        "weight": 0.3,
-        "fillOpacity": 0.85,
-    },
-    tooltip=GeoJsonTooltip(
-        fields=["Colony", "Incidents", "Area_km²", "Incidents_per_km²"],
-        aliases=["Colonia", "Incidentes (2 tipos)", "Área (km²)", "Incidentes/km²"],
-        localize=True,
-        sticky=True,
-    ),
-    name="Densidad de robos"
-).add_to(density_layer)
-density_layer.add_to(m)
-cmap.add_to(m)  # legend
-
-"""
-## 6) Nominatim Utilities
-"""
-
+# ----- Nominatim utils -----
 NOMINATIM_BASE = "https://nominatim.openstreetmap.org"
 HEADERS = {"User-Agent": "security-challenge-nominatim/1.0 (a01662243@tec.mx)"}
+
 
 def nom_geocode(address: str, limit: int = 5, lang: str = "es"):
     params = {
@@ -235,12 +109,15 @@ def nom_geocode(address: str, limit: int = 5, lang: str = "es"):
         "addressdetails": 1,
         "limit": limit,
         "accept-language": lang,
-        "polygon_geojson": 1
+        "polygon_geojson": 1,
     }
-    r = requests.get(f"{NOMINATIM_BASE}/search", params=params, headers=HEADERS, timeout=30)
+    r = requests.get(
+        f"{NOMINATIM_BASE}/search", params=params, headers=HEADERS, timeout=30
+    )
     r.raise_for_status()
     time.sleep(1)
     return r.json()
+
 
 def nom_reverse(lat: float, lon: float, zoom: int = 18, lang: str = "es"):
     params = {
@@ -249,20 +126,28 @@ def nom_reverse(lat: float, lon: float, zoom: int = 18, lang: str = "es"):
         "format": "jsonv2",
         "zoom": zoom,
         "addressdetails": 1,
-        "accept-language": lang
+        "accept-language": lang,
     }
-    r = requests.get(f"{NOMINATIM_BASE}/reverse", params=params, headers=HEADERS, timeout=30)
+    r = requests.get(
+        f"{NOMINATIM_BASE}/reverse", params=params, headers=HEADERS, timeout=30
+    )
     r.raise_for_status()
     time.sleep(1)
     return r.json()
 
+
 def bbox_from_result(item):
+    # Nominatim boundingbox -> [south, north, west, east]
     if "boundingbox" not in item:
         return None
     south, north, west, east = map(float, item["boundingbox"])
     return south, north, west, east
 
-def search_pois_in_viewbox(query: str, viewbox, bounded: bool = True, limit: int = 80, lang: str = "es"):
+
+def search_pois_in_viewbox(
+    query: str, viewbox, bounded: bool = True, limit: int = 80, lang: str = "es"
+):
+    # viewbox en Nominatim (west, north, east, south)
     south, north, west, east = viewbox
     params = {
         "q": query,
@@ -271,12 +156,15 @@ def search_pois_in_viewbox(query: str, viewbox, bounded: bool = True, limit: int
         "limit": limit,
         "accept-language": lang,
         "viewbox": f"{west},{north},{east},{south}",
-        "bounded": 1 if bounded else 0
+        "bounded": 1 if bounded else 0,
     }
-    r = requests.get(f"{NOMINATIM_BASE}/search", params=params, headers=HEADERS, timeout=30)
+    r = requests.get(
+        f"{NOMINATIM_BASE}/search", params=params, headers=HEADERS, timeout=30
+    )
     r.raise_for_status()
     time.sleep(1)
     return r.json()
+
 
 def enrich_point(item):
     addr = item.get("address", {})
@@ -293,6 +181,7 @@ def enrich_point(item):
         "postcode": addr.get("postcode"),
         "country": addr.get("country"),
     }
+
 
 def popup_html(props):
     fields = [
@@ -312,138 +201,382 @@ def popup_html(props):
     )
     return f"<table>{rows}</table>"
 
-def add_points_layer(m, points, name, color='#3388ff', show=True):
+
+def add_points_layer(m, points, name, color="#3388ff", show=True):
+    if not points:
+        return None
     fg = folium.FeatureGroup(name=name, show=show)
     for p in points:
         folium.CircleMarker(
             location=[p["lat"], p["lon"]],
             radius=5,
-            color=color, fill=True, fill_opacity=0.9,
+            color=color,
+            fill=True,
+            fill_opacity=0.9,
             tooltip=p.get("name", name),
-            popup=folium.Popup(popup_html(p), max_width=360)
+            popup=folium.Popup(popup_html(p), max_width=360),
         ).add_to(fg)
     fg.add_to(m)
     return fg
 
-"""
-## 7) Run Nominatim Queries & Build POI Layers
-"""
 
-# Choose PLACE for bbox/polygon
-PLACE = "Ciudad de México"  # change if needed, e.g. "Coyoacán, CDMX"
+# =============== Carga de datos base (colonias/metro/crímenes) ===============
+with st.spinner("Cargando shapefile/CSV…"):
+    # Colonias
+    colonias_raw = gpd.read_file(up_colonias or COLONIAS_PATH).to_crs(4326)
+    col_name_src = pick_col_ci(
+        colonias_raw.columns,
+        ["nomut", "nomdt", "nombre", "nom_col", "nomgeo", "name", "colonia"],
+    )
+    if col_name_src is None:
+        st.stop()
+    colonias_raw["Colony"] = colonias_raw[col_name_src].map(clean_parens)
+    colonias = colonias_raw.dissolve(by="Colony", as_index=False)
+    colonias["key_norm"] = key_norm(colonias["Colony"])
+    col_m = colonias.to_crs(3857)
+    colonias["Area_km²"] = (col_m.geometry.area / 1e6).values
 
-candidates = nom_geocode(PLACE, limit=5, lang="es")
-if not candidates:
-    raise RuntimeError("No results for the given PLACE. Try a more specific query.")
+    # Metro (opcional pero útil)
+    mdf = pd.read_csv(up_metro or METRO_CSV)
+    lon_m = pick_col_ci(mdf.columns, ["longitud", "lon", "longitude", "lng", "x"])
+    lat_m = pick_col_ci(mdf.columns, ["latitud", "lat", "latitude", "y"])
+    nam_m = pick_col_ci(
+        mdf.columns, ["nombre", "name", "station", "estacion", "estación"]
+    )
+    xfer_m = pick_col_ci(
+        mdf.columns, ["es_transbordo", "transbordo", "transfer", "is_transfer"]
+    )
+    if nam_m is None:
+        mdf["station_name"] = np.arange(len(mdf)).astype(str)
+    else:
+        mdf = mdf.rename(columns={nam_m: "station_name"})
+    if xfer_m is None:
+        mdf["es_transbordo"] = 0
+    else:
+        mdf = mdf.rename(columns={xfer_m: "es_transbordo"})
 
-# Prefer polygon result
-chosen = None
-for item in candidates:
-    gj = item.get("geojson", {})
-    if gj and gj.get("type") in ("Polygon", "MultiPolygon"):
-        chosen = item
-        break
-if chosen is None:
-    chosen = candidates[0]
+    metro_all = gpd.GeoDataFrame(
+        mdf[["station_name", "es_transbordo", lon_m, lat_m]].copy(),
+        geometry=gpd.points_from_xy(mdf[lon_m], mdf[lat_m]),
+        crs="EPSG:4326",
+    )
 
-lat0, lon0 = float(chosen["lat"]), float(chosen["lon"])
-viewbox = bbox_from_result(chosen)
+    # Crímenes (para choropleth y heatmap)
+    hdr = pd.read_csv(up_crimes or CRIMES_CSV, nrows=0)
+    c_grp = pick_col_ci(
+        hdr.columns, ["delito_grupo", "crime_group", "offense_group", "category"]
+    )
+    c_lon = pick_col_ci(hdr.columns, ["longitud", "longitude", "lon", "lng", "x"])
+    c_lat = pick_col_ci(hdr.columns, ["latitud", "latitude", "lat", "y"])
+    c_dat = pick_col_ci(
+        hdr.columns,
+        [
+            "fecha",
+            "fecha_hechos",
+            "f_hecho",
+            "date",
+            "datetime",
+            "created_at",
+            "fechahora",
+            "hora_hecho",
+        ],
+    )
+    usecols = [c for c in [c_grp, c_lon, c_lat, c_dat] if c]
+    cr_df = pd.read_csv(up_crimes or CRIMES_CSV, usecols=usecols, low_memory=False)
 
-# Boundary polygon
-gj = chosen.get("geojson")
-if gj:
-    folium.GeoJson(
-        gj,
-        name="Área de referencia (Nominatim)",
-        style_function=lambda x: {"fillColor": "#FFB74D", "color": "#E64A19", "weight": 2, "fillOpacity": 0.20},
-        highlight_function=lambda x: {"weight": 3}
-    ).add_to(m)
-
-# Reverse geocoding marker
-try:
-    rev = nom_reverse(lat0, lon0, zoom=18, lang="es")
-    center_name = rev.get("display_name", "Centro del área")
-    folium.Marker(
-        [lat0, lon0],
-        tooltip="Reverse geocoding (centro)",
-        popup=folium.Popup(f"<b>Centro:</b><br>{center_name}", max_width=360),
-        icon=folium.Icon(color="green", icon="info-sign")
-    ).add_to(m)
-except Exception as e:
-    print("Reverse geocoding failed:", e)
-
-# Custom POIs (required)
-CUSTOM_POI_QUERIES = ["alamedas", "bellas artes", "zocalo", "bancos"]
-
-custom_points = []
-if viewbox:
-    for q in CUSTOM_POI_QUERIES:
-        try:
-            res = search_pois_in_viewbox(q, viewbox=viewbox, limit=80, lang="es")
-            custom_points.extend(enrich_point(r) for r in res)
-        except Exception as e:
-            print(f"Búsqueda personalizada '{q}' falló: {e}")
-
-if custom_points:
-    custom_fg = add_points_layer(m, custom_points, name="POIs personalizados (Alamedas/Bellas Artes/Zócalo/Bancos)", color="#6ab04c", show=True)
-
-# Optional broader POIs
-POI_TOURISM = ["museum", "hotel", "tourist attraction"]
-POI_ECON    = ["bank", "cajero","coworking"]
-
-tourism_points, econ_points = [], []
-if viewbox:
-    for q in POI_TOURISM:
-        try:
-            res = search_pois_in_viewbox(q, viewbox=viewbox, limit=80, lang="es")
-            tourism_points.extend(enrich_point(r) for r in res)
-        except Exception as e:
-            print(f"Tourism query '{q}' failed: {e}")
-    for q in POI_ECON:
-        try:
-            res = search_pois_in_viewbox(q, viewbox=viewbox, limit=80, lang="es")
-            econ_points.extend(enrich_point(r) for r in res)
-        except Exception as e:
-            print(f"Economic query '{q}' failed: {e}")
-
-if tourism_points:
-    add_points_layer(m, tourism_points, name="POIs Turismo", color="#3388ff", show=False)
-if econ_points:
-    add_points_layer(m, econ_points,    name="POIs Actividad Económica", color="#9b59b6", show=False)
-
-# Search Control for POIs
-features = []
-def to_feature(p):
-    return {
-        "type":"Feature",
-        "properties":{"name": p.get("name","(sin nombre)")},
-        "geometry":{"type":"Point","coordinates":[p["lon"], p["lat"]]}
+    raw_norm = key_norm(cr_df[c_grp]) if c_grp else pd.Series([], dtype=str)
+    map_dict = {
+        "ROBO TRANSEUNTE": "ROBBERY_PEDESTRIAN",
+        "ROBO A TRANSEUNTE": "ROBBERY_PEDESTRIAN",
+        "ROBBERY_PEDESTRIAN": "ROBBERY_PEDESTRIAN",
+        "ROBO OBJETOS": "ROBBERY_OBJECT",
+        "ROBO DE OBJETOS": "ROBBERY_OBJECT",
+        "ROBBERY_OBJECT": "ROBBERY_OBJECT",
     }
+    if c_grp:
+        cr_df["_crime_norm"] = raw_norm.map(map_dict).fillna(raw_norm)
+        cr_df = cr_df[
+            cr_df["_crime_norm"].isin({"ROBBERY_PEDESTRIAN", "ROBBERY_OBJECT"})
+        ].copy()
 
-for coll in [custom_points, tourism_points, econ_points]:
-    for p in coll:
-        features.append(to_feature(p))
+    cr_df["_lon"] = pd.to_numeric(cr_df[c_lon], errors="coerce")
+    cr_df["_lat"] = pd.to_numeric(cr_df[c_lat], errors="coerce")
+    cr_df = cr_df.dropna(subset=["_lon", "_lat"])
 
-if features:
-    gj_points = {"type":"FeatureCollection","features":features}
+    if c_dat:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            cr_df["_ts"] = pd.to_datetime(
+                cr_df[c_dat], errors="coerce", utc=True
+            ).dt.tz_convert("America/Mexico_City")
+    else:
+        cr_df["_ts"] = pd.NaT
+
+    gdf_crimes = gpd.GeoDataFrame(
+        cr_df,
+        geometry=gpd.points_from_xy(cr_df["_lon"], cr_df["_lat"]),
+        crs="EPSG:4326",
+    )
+
+# =============== Choropleth (inc./km²) ===============
+joined = gpd.sjoin(
+    gdf_crimes, colonias[["key_norm", "geometry"]], how="inner", predicate="within"
+)
+counts = joined.groupby("key_norm").size().rename("Incidents").reset_index()
+choropleth = (
+    colonias[["Colony", "key_norm", "geometry", "Area_km²"]]
+    .merge(counts, on="key_norm", how="left")
+    .fillna({"Incidents": 0})
+)
+choropleth["Incidents_per_km²"] = (
+    choropleth["Incidents"] / choropleth["Area_km²"].replace({0: np.nan})
+).fillna(0.0)
+
+# =============== Mapa base ===============
+tb = choropleth.total_bounds if len(choropleth) else None
+if not valid_bounds(tb):
+    # CDMX por defecto
+    minx, miny, maxx, maxy = (-99.35, 19.2, -98.9, 19.6)
+else:
+    minx, miny, maxx, maxy = tb
+
+center_lon, center_lat = (minx + maxx) / 2, (miny + maxy) / 2
+m = folium.Map(
+    location=[center_lat, center_lon],
+    zoom_start=11,
+    tiles="cartodbpositron",
+    control_scale=True,
+)
+Fullscreen().add_to(m)
+MiniMap(toggle_display=True).add_to(m)
+MeasureControl(primary_length_unit="meters").add_to(m)
+MousePosition(position="bottomright").add_to(m)
+
+# Choropleth
+vmin = float(choropleth["Incidents_per_km²"].min())
+vmax = float(choropleth["Incidents_per_km²"].max())
+cmap = linear.Purples_09.scale(vmin, vmax)
+cmap.caption = "Incidentes por km² (robos seleccionados)"
+_ch = choropleth.copy()
+_ch["val"] = _ch["Incidents_per_km²"].astype(float)
+
+clayer = folium.FeatureGroup(name="Densidad de robos (Inc./km²)", show=True)
+GeoJson(
+    data=_ch.to_json(),
+    style_function=lambda f: {
+        "fillColor": (
+            cmap(f["properties"]["val"])
+            if f["properties"]["val"] is not None
+            else "#f3f0ff"
+        ),
+        "color": "#4b5563",
+        "weight": 0.3,
+        "fillOpacity": 0.85,
+    },
+    tooltip=GeoJsonTooltip(
+        fields=["Colony", "Incidents", "Area_km²", "Incidents_per_km²"],
+        aliases=["Colonia", "Incidentes (2 tipos)", "Área (km²)", "Incidentes/km²"],
+        localize=True,
+        sticky=True,
+    ),
+).add_to(clayer)
+clayer.add_to(m)
+cmap.add_to(m)
+
+# Límites colonias
+borders = folium.FeatureGroup(name="Colonias (límites)", show=False)
+GeoJson(
+    data=colonias[["Colony", "geometry"]].to_json(),
+    style_function=lambda f: {"fillOpacity": 0.0, "color": "#7e22ce", "weight": 1.2},
+    tooltip=GeoJsonTooltip(fields=["Colony"], aliases=["Colonia"]),
+).add_to(borders)
+borders.add_to(m)
+
+# Metro (si hay puntos válidos)
+metro_layer, added_any = (
+    folium.FeatureGroup(name="Estaciones de Metro", show=False),
+    False,
+)
+for _, r in metro_all.iterrows():
+    if r.geometry is None or pd.isna(r.geometry.x) or pd.isna(r.geometry.y):
+        continue
+    folium.CircleMarker(
+        location=[r.geometry.y, r.geometry.x],
+        radius=4,
+        color="#44403c",
+        fill=True,
+        fill_opacity=1.0,
+        tooltip=f"{r.get('station_name','(station)')} | Transferencia: {int(r.get('es_transbordo',0))}",
+    ).add_to(metro_layer)
+    added_any = True
+if added_any:
+    metro_layer.add_to(m)
+
+# Heatmap 24h (si hay timestamps)
+if cr_df["_ts"].notna().any():
+    tmax = pd.to_datetime(cr_df.loc[cr_df["_ts"].notna(), "_ts"]).max()
+    tmin = tmax - pd.Timedelta(hours=24)
+    recent = gdf_crimes[
+        (gdf_crimes["_ts"] >= tmin) & (gdf_crimes["_ts"] <= tmax)
+    ].copy()
+    if len(recent):
+        recent["hour"] = recent["_ts"].dt.floor("h")
+        hours = sorted(recent["hour"].unique())
+        heat_seq = [
+            recent[recent["hour"] == h][["_lat", "_lon"]].values.tolist() for h in hours
+        ]
+        HeatMapWithTime(
+            heat_seq,
+            index=[str(h) for h in hours],
+            auto_play=False,
+            max_opacity=0.8,
+            radius=9,
+            name="Heatmap robos",
+        ).add_to(m)
+
+# =============== Nominatim: área y POIs (DENTRO del viewbox) ===============
+st.markdown("#### 🧭 Mapa")
+
+# 1) Buscar PLACE y dibujar polígono
+try:
+    candidates = nom_geocode(PLACE, limit=5, lang="es")
+except Exception as e:
+    candidates = []
+    st.warning(f"Nominatim no disponible: {e}")
+
+viewbox = None
+if candidates:
+    # Elegir MultiPolygon/Polygon preferentemente
+    chosen = None
+    for item in candidates:
+        gj = item.get("geojson", {})
+        if gj and gj.get("type") in ("Polygon", "MultiPolygon"):
+            chosen = item
+            break
+    if chosen is None:
+        chosen = candidates[0]
+
+    lat0, lon0 = float(chosen["lat"]), float(chosen["lon"])
+    viewbox = bbox_from_result(chosen)
+
+    gj = chosen.get("geojson")
+    if gj:
+        folium.GeoJson(
+            gj,
+            name="Área de referencia (Nominatim)",
+            style_function=lambda x: {
+                "fillColor": "#FFB74D",
+                "color": "#E64A19",
+                "weight": 2,
+                "fillOpacity": 0.20,
+            },
+        ).add_to(m)
+
+    try:
+        rev = nom_reverse(lat0, lon0, zoom=18, lang="es")
+        folium.Marker(
+            [lat0, lon0],
+            tooltip="Centro (reverse geocoding)",
+            popup=folium.Popup(
+                f"<b>Centro:</b><br>{rev.get('display_name','')}", max_width=360
+            ),
+            icon=folium.Icon(color="green", icon="info-sign"),
+        ).add_to(m)
+    except Exception:
+        pass
+
+# 2) Consultas de POIs dentro del viewbox
+poi_layers = []
+all_points = []
+
+
+def collect_points(queries, vb, color, name, show):
+    pts = []
+    if not vb:
+        return None, pts
+    for q in queries:
+        try:
+            res = search_pois_in_viewbox(q, viewbox=vb, limit=80, lang="es")
+            pts.extend(enrich_point(r) for r in res)
+        except Exception as e:
+            st.write(f"Consulta '{q}' falló: {e}")
+    if pts:
+        layer = add_points_layer(m, pts, name=name, color=color, show=show)
+        return layer, pts
+    return None, pts
+
+
+# Personalizados (incluye "bancos" por defecto)
+layer_custom, pts_custom = collect_points(
+    CUSTOM_POIS, viewbox, "#6ab04c", "POIs personalizados", True
+)
+poi_layers.append(layer_custom)
+all_points.extend(pts_custom)
+
+# Turismo
+tourism_q = ["museum", "hotel", "tourist attraction"]
+layer_tour, pts_tour = collect_points(
+    tourism_q, viewbox, "#3388ff", "POIs Turismo", False
+)
+poi_layers.append(layer_tour)
+all_points.extend(pts_tour)
+
+# Económicos (bancos/cajero/coworking)
+econ_q = ["bank", "cajero", "coworking"]
+layer_econ, pts_econ = collect_points(
+    econ_q, viewbox, "#9b59b6", "POIs Actividad Económica", False
+)
+poi_layers.append(layer_econ)
+all_points.extend(pts_econ)
+
+# 3) Capa de búsqueda por nombre (si hubo puntos)
+if all_points:
+    features = [
+        {
+            "type": "Feature",
+            "properties": {"name": p.get("name", "(sin nombre)")},
+            "geometry": {"type": "Point", "coordinates": [p["lon"], p["lat"]]},
+        }
+        for p in all_points
+    ]
+    gj_points = {"type": "FeatureCollection", "features": features}
     gj_layer = folium.GeoJson(
         gj_points,
         name="Búsqueda por nombre (POIs)",
-        tooltip=folium.features.GeoJsonTooltip(fields=["name"], aliases=["Nombre"])
+        tooltip=folium.features.GeoJsonTooltip(fields=["name"], aliases=["Nombre"]),
     ).add_to(m)
     Search(
         layer=gj_layer,
-        geom_type='Point',
-        search_label='name',
-        placeholder='Buscar POI por nombre…',
-        collapsed=False
+        geom_type="Point",
+        search_label="name",
+        placeholder="Buscar POI por nombre…",
+        collapsed=False,
     ).add_to(m)
 
-"""
-## 8) Layer Control, Save & Download Map
-"""
-
+# 4) Control de capas
 folium.LayerControl(collapsed=False).add_to(m)
-map_html_path = os.path.join(BASE_DIR, 'combined_security_challenge_map.html')
-m.save(map_html_path)
-print(f"Mapa guardado en: {map_html_path}")
+
+# 5) Render (siempre visible)
+_rendered = False
+try:
+    folium_static(m, width=None, height=720)  # estable
+    _rendered = True
+except Exception as e:
+    st.warning(f"No se pudo renderizar con folium_static. Fallback HTML. Detalle: {e}")
+
+if not _rendered:
+    html_map = m.get_root().render()
+    components.html(html_map, height=720)
+
+# 6) Export HTML
+map_html_path = BASE_DIR / "combined_security_challenge_map.html"
+m.save(str(map_html_path))
+st.success(f"Mapa exportado a: {map_html_path.name}")
+
+with open(map_html_path, "rb") as f:
+    st.download_button(
+        "⬇️ Descargar HTML del mapa",
+        data=f,
+        file_name=map_html_path.name,
+        mime="text/html",
+    )
