@@ -1,1 +1,13 @@
-FGJ_CLEAN_Team2.csv
+# Entorno virtual
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+*.log
+*.sqlite3
+*.db
+.streamlit/
